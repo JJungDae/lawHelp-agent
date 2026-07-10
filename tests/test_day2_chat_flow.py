@@ -1,9 +1,18 @@
 from fastapi.testclient import TestClient
+import pytest
 
 from app.main import app
 
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def fake_generate_text(monkeypatch):
+    def _fake_generate_text(prompt: str, system=None) -> str:
+        return "테스트 LLM 답변입니다."
+
+    monkeypatch.setattr("app.agents.nodes.generate_text", _fake_generate_text)
 
 
 def test_health():
@@ -26,6 +35,7 @@ def test_chat_sync_normal_question():
     assert data["is_fallback"] is False
     assert data["retrieved_count"] >= 1
     assert data["category"] == "임대차"
+    assert "이 답변은 일반 정보 제공이며 법률 자문이 아닙니다." in data["answer"]
 
 
 def test_chat_sync_blocked_question():
