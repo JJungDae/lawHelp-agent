@@ -6,4 +6,7 @@ python-dotenv>=1,<2
 chromadb>=1,<2
 streamlit>=1.35,<2
 requests>=2.31,<3
+<<<<<<< HEAD
 litellm>=1,<2
+=======
+>>>>>>> 5c6afdf (chore: add chromadb and streamlit deps, ignore chroma_db)
