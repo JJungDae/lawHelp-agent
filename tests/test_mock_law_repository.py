@@ -11,14 +11,14 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from app.repositories.mock_law_repository import load_law_qa, search_law_qa  # noqa: E402
 
 
-def test_load_law_qa_returns_4_documents_with_required_fields():
+def test_load_law_qa_returns_all_documents_with_required_fields():
     documents = load_law_qa()
-    assert len(documents) == 4
+    assert len(documents) == 20
     for document in documents:
         assert document.id
         assert document.question
         assert document.answer
-        assert document.category in ("임대차", "근로")
+        assert document.category in ("임대차", "근로", "복지")
 
 
 def test_search_normal_question_returns_matching_documents():
