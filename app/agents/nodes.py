@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Any, Dict, Optional, TypedDict, Union
 
+from app.core.llm import generate_text
 from app.schemas.document import RetrievedDocument
 
 
@@ -12,6 +13,18 @@ BLOCKED_ANSWER = (
 
 FALLBACK_ANSWER = "관련 정보를 충분히 찾지 못했습니다. 질문을 조금 더 구체적으로 입력해 주세요."
 LEGAL_NOTICE = "이 답변은 일반 정보 제공이며 법률 자문이 아닙니다."
+GENERATION_SYSTEM_PROMPT = (
+    "너는 법제처 생활법령 백문백답 기반 생활법률 안내 챗봇이다.\n"
+    "규칙:\n"
+    "- 제공된 근거 안에서만 답변한다.\n"
+    "- 근거에 없는 내용은 단정하지 말고 \"확인 불가\" 또는 \"전문기관 상담 권장\"으로 처리한다.\n"
+    "- 사용자의 상황을 먼저 짧게 정리한다.\n"
+    "- 관련 제도/권리를 쉬운 말로 설명한다.\n"
+    "- 다음 행동을 안내한다.\n"
+    "- 법률 용어는 한 줄 풀이를 덧붙인다.\n"
+    "- 강한 지시보다 안내형 표현을 사용한다.\n"
+    f"- 답변 말미에 반드시 \"{LEGAL_NOTICE}\"를 포함한다."
+)
 
 DANGEROUS_PHRASES = (
     "승소",
@@ -82,13 +95,15 @@ def generate(state: AgentState) -> AgentState:
     if not documents:
         return fallback_response(state)
 
-    primary_document = documents[0]
-    answer = _build_guidance_answer(primary_document)
+    answer = generate_text(
+        prompt=_build_generation_prompt(state.get("message", ""), documents),
+        system=GENERATION_SYSTEM_PROMPT,
+    )
 
     return {
         **state,
         "answer": answer,
-        "category": primary_document.category,
+        "category": documents[0].category,
         "guardrail_blocked": False,
         "is_fallback": False,
         "retrieved_count": len(documents),
@@ -124,8 +139,16 @@ def fallback_response(state: AgentState) -> AgentState:
 
 
 def _search_law_qa(query: str) -> list[RetrievedDocument]:
-    repository_path = Path(__file__).resolve().parents[1] / "repositories" / "mock_law_repository.py"
-    if not repository_path.exists():
+    repositories_dir = Path(__file__).resolve().parents[1] / "repositories"
+
+    chroma_repository_path = repositories_dir / "chroma_law_repository.py"
+    if chroma_repository_path.exists():
+        from app.repositories.chroma_law_repository import search_law_qa
+
+        return [_coerce_document(document) for document in search_law_qa(query)]
+
+    mock_repository_path = repositories_dir / "mock_law_repository.py"
+    if not mock_repository_path.exists():
         return _temporary_search_law_qa(query)
 
     from app.repositories.mock_law_repository import search_law_qa
@@ -213,22 +236,24 @@ def _score_document(document: RetrievedDocument, query_keywords: set[str]) -> in
     return score
 
 
-def _build_guidance_answer(document: RetrievedDocument) -> str:
-    softened_answer = _soften_answer(document.answer)
-    return f"{document.category} 관련해서는 아래 내용을 확인해 보세요.\n{softened_answer}"
+def _build_generation_prompt(message: str, documents: list[RetrievedDocument]) -> str:
+    evidence = "\n\n".join(
+        (
+            f"{index}. 분야: {document.category}\n"
+            f"   질문: {document.question}\n"
+            f"   답변: {document.answer}"
+        )
+        for index, document in enumerate(documents, start=1)
+    )
 
-
-def _soften_answer(answer: str) -> str:
-    softened = answer.strip()
-    if softened.endswith("."):
-        softened = softened[:-1]
-
-    replacements = {
-        "확인이 필요합니다": "확인해 보시는 것이 좋습니다",
-        "필요합니다": "확인해 보시는 것이 좋습니다",
-        "해야 합니다": "확인해 보시는 것이 좋습니다",
-    }
-    for original, replacement in replacements.items():
-        softened = softened.replace(original, replacement)
-
-    return f"{softened}."
+    return (
+        "[사용자 질문]\n"
+        f"{message}\n\n"
+        "[검색된 근거]\n"
+        f"{evidence}\n\n"
+        "[답변 형식]\n"
+        "1. 상황 정리\n"
+        "2. 관련 제도/권리\n"
+        "3. 다음 행동\n"
+        "4. 일반 정보 제공 고지"
+    )
