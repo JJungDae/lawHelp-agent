@@ -25,7 +25,22 @@ jobs:
             git checkout main
             git pull --ff-only origin main
 
+            docker compose build api frontend
+
+            CHROMA_COUNT=$(
+              docker compose run --rm api python -c "import chromadb; print(chromadb.PersistentClient(path='chroma_db').get_collection('law_qa').count())" 2>/dev/null || echo 0
+            )
+            case "$CHROMA_COUNT" in
+              ''|*[!0-9]*) CHROMA_COUNT=0 ;;
+            esac
+
+            if [ "$CHROMA_COUNT" -lt 1 ]; then
+              docker compose --profile tools run --rm ingest
+            else
+              echo "ChromaDB already initialized: ${CHROMA_COUNT} documents"
+            fi
+
             docker compose down
-            docker compose up -d --build
+            docker compose up -d
             docker compose ps
             curl -f http://localhost:8000/health
