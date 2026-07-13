@@ -24,10 +24,11 @@ COLLECTION_NAME = "law_qa"
 EMBEDDING_URL = "https://api.upstage.ai/v1/embeddings"
 EMBEDDING_MODEL = "embedding-query"  # 적재(embedding-passage)와 쌍을 이루는 질의용 모델
 
-# 검색 부족 판정 임계값 (cosine distance, 팀 승인 2026-07-10)
-# 근거: scripts/check_search.py 20건 기준 — 관련 매칭 0.47~0.53, 무관 최근접 0.75.
-# 두 분포의 중간값으로 양쪽에 ~0.1 여유. 전량(~1,200건) 적재 후 재점검 필요.
-SCORE_THRESHOLD = 0.65
+# 검색 부족 판정 임계값 (cosine distance, 팀 승인 2026-07-13)
+# 근거: scripts/check_search.py 실데이터 156건 기준 —
+# 관련 매칭(normal 10문항 top-1) 0.4170~0.5882, 무관 질문 최근접 0.6130.
+# 두 분포의 중간값. 분포 간격이 좁으므로(양쪽 여유 ±0.013) 데이터 추가 적재 시 재측정 필요.
+SCORE_THRESHOLD = 0.60
 
 _INGEST_GUIDE = "scripts/ingest_chroma.py를 먼저 실행하세요."
 
@@ -101,3 +102,18 @@ def search_law_qa(query: str, top_k: int = 3) -> list[RetrievedDocument]:
             )
         )
     return retrieved
+
+
+def get_source_url(document_id: str) -> str | None:
+    """문서 id로 원문링크(source_url metadata)를 조회한다.
+
+    - 파트 A의 generate/output_guardrail이 답변 끝 링크 부착에 사용한다.
+      (RetrievedDocument 스키마를 바꾸지 않고 링크를 전달하기 위한 별도 헬퍼)
+    - 존재하지 않는 id 또는 source_url이 없는 문서면 None.
+    - 저장소 미준비 시에는 기존 규칙대로 RuntimeError (조용한 실패 금지).
+    """
+    collection = _get_collection()
+    result = collection.get(ids=[document_id])
+    if not result["ids"]:
+        return None
+    return result["metadatas"][0].get("source_url") or None
