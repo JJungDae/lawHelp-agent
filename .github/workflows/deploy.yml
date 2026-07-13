@@ -1,0 +1,31 @@
+name: Deploy to GCE
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.GCE_HOST }}
+          username: ${{ secrets.GCE_USER }}
+          key: ${{ secrets.GCE_SSH_KEY }}
+          script: |
+            set -e
+
+            cd /home/appuser/lawHelp-agent
+            git fetch origin main
+            git checkout main
+            git pull --ff-only origin main
+
+            docker compose down
+            docker compose up -d --build
+            docker compose ps
+            curl -f http://localhost:8000/health
