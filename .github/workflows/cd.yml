@@ -25,6 +25,11 @@ jobs:
             git checkout main
             git pull --ff-only origin main
 
+            df -h /
+            docker system df || true
+            docker builder prune -af || true
+            docker image prune -af || true
+
             docker compose build api frontend
 
             CHROMA_COUNT=$(
