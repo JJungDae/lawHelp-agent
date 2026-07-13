@@ -1,6 +1,8 @@
 from pathlib import Path
 from typing import Any, Dict, Optional, TypedDict, Union
 
+from loguru import logger
+
 from app.core.llm import generate_text
 from app.schemas.document import RetrievedDocument
 
@@ -22,9 +24,13 @@ GENERATION_SYSTEM_PROMPT = (
     "- 관련 제도/권리를 쉬운 말로 설명한다.\n"
     "- 다음 행동을 안내한다.\n"
     "- 법률 용어는 한 줄 풀이를 덧붙인다.\n"
-    "- 강한 지시보다 안내형 표현을 사용한다.\n"
-    f"- 답변 말미에 반드시 \"{LEGAL_NOTICE}\"를 포함한다."
+    "- 강한 지시보다 안내형 표현을 사용한다."
 )
+# 고지문은 LLM에게 시키지 않고 코드가 부착한다 —
+# sync는 output_guardrail, stream은 chat.py의 tail 전송이 담당한다.
+# (본문 → 원문 링크 → 고지문 순서를 두 경로에서 동일하게 보장하기 위함)
+
+SOURCE_LINK_TEMPLATE = "더 도움이 필요하시면 {url} 에서 추가 정보를 확인할 수 있습니다."
 
 DANGEROUS_PHRASES = (
     "승소",
@@ -110,17 +116,45 @@ def generate(state: AgentState) -> AgentState:
     }
 
 
+def build_source_link_line(documents: list[RetrievedDocument]) -> Optional[str]:
+    """검색 top-1 문서의 원문 링크 문구를 만든다. sync/stream 공용 (문구 단일 정의).
+
+    링크를 얻지 못하는 모든 경우(문서 없음, source_url 없음, 저장소 예외)에
+    None을 반환해 답변 반환을 막지 않는다. 예외는 warning 로그만 남긴다.
+    """
+    if not documents:
+        return None
+    try:
+        from app.repositories.chroma_law_repository import get_source_url
+
+        url = get_source_url(documents[0].id)
+    except Exception as exc:
+        logger.warning("원문 링크 조회 실패 — 링크 없이 답변을 반환한다: {}", exc)
+        return None
+    if not url:
+        return None
+    return SOURCE_LINK_TEMPLATE.format(url=url)
+
+
 def output_guardrail(state: AgentState) -> AgentState:
     if state.get("guardrail_blocked") or state.get("is_fallback"):
         return state
 
     answer = state.get("answer", "").strip()
-    if LEGAL_NOTICE not in answer:
-        answer = f"{answer}\n\n{LEGAL_NOTICE}"
+    # 본문 → 링크 → 고지문 순서를 보장하기 위해, LLM이 임의로 넣은 고지문은
+    # 떼어낸 뒤 마지막에 다시 부착한다.
+    if LEGAL_NOTICE in answer:
+        answer = answer.replace(LEGAL_NOTICE, "").strip()
+
+    parts = [answer]
+    link_line = build_source_link_line(state.get("documents", []))
+    if link_line:
+        parts.append(link_line)
+    parts.append(LEGAL_NOTICE)
 
     return {
         **state,
-        "answer": answer,
+        "answer": "\n\n".join(parts),
         "guardrail_blocked": False,
         "is_fallback": False,
     }

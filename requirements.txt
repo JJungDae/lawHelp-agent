@@ -7,5 +7,6 @@ chromadb>=1,<2
 streamlit>=1.35,<2
 requests>=2.31,<3
 litellm>=1,<2
+loguru>=0.7,<1
 ruff>=0.8,<1
 pytest>=8,<9
