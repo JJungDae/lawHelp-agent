@@ -1,6 +1,7 @@
 from typing import Any, Dict, Iterator, List, Optional
 
 from app.core.config import settings
+from app.core.observability import start_observation, summarize_messages
 
 
 DEFAULT_SYSTEM_PROMPT = "너는 법제처 생활법령 백문백답 기반 생활법률 안내 챗봇이다."
@@ -12,34 +13,62 @@ class LLMError(Exception):
 
 
 def generate_text(prompt: str, system: Optional[str] = None) -> str:
-    """Upstage Solar 답변을 문자열로 반환한다."""
-    try:
-        response = _completion(
-            messages=_build_messages(prompt=prompt, system=system),
-            stream=False,
-        )
-        content = _extract_message_content(response)
-    except Exception as exc:
-        raise LLMError("LLM text generation failed.") from exc
+    """Upstage Solar 응답을 문자열로 반환한다."""
+    messages = _build_messages(prompt=prompt, system=system)
 
-    if not content:
-        raise LLMError("LLM returned an empty response.")
-    return content
+    with start_observation(
+        name="generation",
+        as_type="generation",
+        input={"messages": summarize_messages(messages)},
+        metadata={"provider": "upstage", "stream": False},
+        model=settings.llm_model,
+        model_parameters={"stream": False},
+    ) as observation:
+        try:
+            response = _completion(
+                messages=messages,
+                stream=False,
+            )
+            content = _extract_message_content(response)
+        except Exception as exc:
+            observation.update(level="ERROR", status_message=type(exc).__name__)
+            raise LLMError("LLM text generation failed.") from exc
+
+        if not content:
+            observation.update(level="ERROR", status_message="empty_response")
+            raise LLMError("LLM returned an empty response.")
+
+        observation.update(output=content, usage_details=_extract_usage_details(response))
+        return content
 
 
 def stream_text(prompt: str, system: Optional[str] = None) -> Iterator[str]:
-    """Upstage Solar 답변 조각을 순차적으로 반환한다."""
-    try:
-        response = _completion(
-            messages=_build_messages(prompt=prompt, system=system),
-            stream=True,
-        )
-        for chunk in response:
-            text = _extract_stream_text(chunk)
-            if text:
-                yield text
-    except Exception as exc:
-        raise LLMError("LLM text streaming failed.") from exc
+    """Upstage Solar 응답 조각을 순차적으로 반환한다."""
+    messages = _build_messages(prompt=prompt, system=system)
+
+    with start_observation(
+        name="generation",
+        as_type="generation",
+        input={"messages": summarize_messages(messages)},
+        metadata={"provider": "upstage", "stream": True},
+        model=settings.llm_model,
+        model_parameters={"stream": True},
+    ) as observation:
+        try:
+            response = _completion(
+                messages=messages,
+                stream=True,
+            )
+            chunks = []
+            for chunk in response:
+                text = _extract_stream_text(chunk)
+                if text:
+                    chunks.append(text)
+                    yield text
+            observation.update(output="".join(chunks))
+        except Exception as exc:
+            observation.update(level="ERROR", status_message=type(exc).__name__)
+            raise LLMError("LLM text streaming failed.") from exc
 
 
 def _completion(messages: List[Dict[str, str]], stream: bool) -> Any:
@@ -89,5 +118,25 @@ def _extract_stream_text(chunk: Any) -> str:
     return content or ""
 
 
-# TODO: Day3에서는 call_with_retry() 기반 재시도 정책을 구현하지 않는다.
-# TODO: Day3에서는 classify_text() 기반 LLM 분류를 구현하지 않는다.
+def _extract_usage_details(response: Any) -> Optional[dict[str, int]]:
+    usage = response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
+    if not usage:
+        return None
+
+    usage_key_map = {
+        "prompt_tokens": "input",
+        "input_tokens": "input",
+        "completion_tokens": "output",
+        "output_tokens": "output",
+        "total_tokens": "total",
+    }
+    usage_details = {}
+    for source_key, target_key in usage_key_map.items():
+        value = usage.get(source_key) if isinstance(usage, dict) else getattr(usage, source_key, None)
+        if isinstance(value, int):
+            usage_details[target_key] = value
+    return usage_details or None
+
+
+# TODO: Day3에서 call_with_retry() 기반 재시도 정책은 구현하지 않는다.
+# TODO: Day3에서 classify_text() 기반 LLM 분류는 구현하지 않는다.

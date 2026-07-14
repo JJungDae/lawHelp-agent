@@ -11,6 +11,7 @@
 """
 
 from pathlib import Path
+from typing import Optional
 
 import chromadb
 import requests
@@ -104,7 +105,7 @@ def search_law_qa(query: str, top_k: int = 3) -> list[RetrievedDocument]:
     return retrieved
 
 
-def get_source_url(document_id: str) -> str | None:
+def get_source_url(document_id: str) -> Optional[str]:
     """문서 id로 원문링크(source_url metadata)를 조회한다.
 
     - 파트 A의 generate/output_guardrail이 답변 끝 링크 부착에 사용한다.

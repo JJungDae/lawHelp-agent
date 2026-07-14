@@ -9,10 +9,21 @@ from app.agents.nodes import (
     retrieve,
     scope_check,
 )
+from app.core.observability import (
+    add_trace_attributes,
+    build_trace_metadata,
+    guardrail_result_from_state,
+    mask_sensitive_text,
+    response_type_from_state,
+    start_trace,
+    trace_tags,
+)
 from app.schemas.chat import ChatResponse
 
 
 _COMPILED_WORKFLOW: Optional[Any] = None
+SYNC_TRACE_NAME = "law-help-chat-sync"
+SYNC_ENDPOINT = "/chat/sync"
 
 
 def run_chat_workflow(message: str, thread_id: Optional[str] = None) -> ChatResponse:
@@ -26,13 +37,58 @@ def run_chat_workflow(message: str, thread_id: Optional[str] = None) -> ChatResp
         "retrieved_count": 0,
     }
 
-    workflow = _get_compiled_workflow()
-    if workflow is None:
-        final_state = _run_function_chain(initial_state)
-    else:
-        final_state = workflow.invoke(initial_state)
+    with start_trace(
+        name=SYNC_TRACE_NAME,
+        input={"question": mask_sensitive_text(message)},
+        metadata=build_trace_metadata(endpoint=SYNC_ENDPOINT, mode="sync"),
+        tags=trace_tags("sync", "pending"),
+    ) as trace:
+        try:
+            workflow = _get_compiled_workflow()
+            if workflow is None:
+                final_state = _run_function_chain(initial_state)
+            else:
+                final_state = workflow.invoke(initial_state)
+        except Exception as exc:
+            add_trace_attributes(
+                trace_name=SYNC_TRACE_NAME,
+                tags=trace_tags("sync", "error"),
+            )
+            trace.update(
+                output={"response_type": "error"},
+                metadata=build_trace_metadata(
+                    endpoint=SYNC_ENDPOINT,
+                    mode="sync",
+                    response_type="error",
+                    success=False,
+                    error_type=type(exc).__name__,
+                ),
+                level="ERROR",
+                status_message=type(exc).__name__,
+            )
+            raise
 
-    return _to_chat_response(final_state)
+        response = _to_chat_response(final_state)
+        response_type = response_type_from_state(final_state)
+        add_trace_attributes(
+            trace_name=SYNC_TRACE_NAME,
+            tags=trace_tags("sync", response_type),
+        )
+        trace.update(
+            output={
+                "response_type": response_type,
+                "answer": response.answer,
+            },
+            metadata=build_trace_metadata(
+                endpoint=SYNC_ENDPOINT,
+                mode="sync",
+                guardrail_result=guardrail_result_from_state(final_state),
+                retrieved_count=final_state.get("retrieved_count", 0),
+                response_type=response_type,
+                success=True,
+            ),
+        )
+        return response
 
 
 def _get_compiled_workflow() -> Optional[Any]:

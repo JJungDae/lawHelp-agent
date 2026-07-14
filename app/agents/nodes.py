@@ -1,8 +1,15 @@
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Dict, Optional, TypedDict, Union
 
 from loguru import logger
 
+from app.core.observability import (
+    DEFAULT_TOP_K,
+    mask_sensitive_text,
+    start_observation,
+    summarize_documents,
+)
 from app.core.llm import generate_text
 from app.schemas.document import RetrievedDocument
 
@@ -62,8 +69,10 @@ class AgentState(TypedDict, total=False):
 
 def scope_check(state: AgentState) -> AgentState:
     message = state.get("message", "")
+    started_at = perf_counter()
     normalized_message = message.casefold()
     is_blocked = any(phrase.casefold() in normalized_message for phrase in DANGEROUS_PHRASES)
+    _record_guardrail_trace(message, is_blocked, _duration_ms(started_at))
 
     return {
         **state,
@@ -85,7 +94,10 @@ def guardrail_exit(state: AgentState) -> AgentState:
 
 
 def retrieve(state: AgentState) -> AgentState:
-    documents = _search_law_qa(state.get("message", ""))
+    message = state.get("message", "")
+    started_at = perf_counter()
+    documents = _search_law_qa(message)
+    _record_retrieval_trace(message, documents, _duration_ms(started_at))
     category = documents[0].category if documents else "기타"
 
     return {
@@ -170,6 +182,46 @@ def fallback_response(state: AgentState) -> AgentState:
         "is_fallback": True,
         "retrieved_count": 0,
     }
+
+
+def _record_guardrail_trace(message: str, is_blocked: bool, duration_ms: float) -> None:
+    with start_observation(
+        name="guardrail",
+        as_type="span",
+        input={"question": mask_sensitive_text(message)},
+        metadata={"rule_count": len(DANGEROUS_PHRASES), "duration_ms": duration_ms},
+    ) as observation:
+        observation.update(
+            output={"result": "blocked" if is_blocked else "allow"},
+            metadata={"reason": "dangerous_phrase" if is_blocked else "none"},
+        )
+
+
+def _record_retrieval_trace(
+    message: str,
+    documents: list[RetrievedDocument],
+    duration_ms: float,
+) -> None:
+    with start_observation(
+        name="retrieval",
+        as_type="span",
+        input={"query": mask_sensitive_text(message), "top_k": DEFAULT_TOP_K},
+        metadata={
+            "repository": "app.agents.nodes._search_law_qa",
+            "duration_ms": duration_ms,
+        },
+    ) as observation:
+        observation.update(
+            output={
+                "retrieved_count": len(documents),
+                "documents": summarize_documents(documents),
+            },
+            metadata={"no_result": len(documents) == 0},
+        )
+
+
+def _duration_ms(started_at: float) -> float:
+    return round((perf_counter() - started_at) * 1000, 2)
 
 
 def _search_law_qa(query: str) -> list[RetrievedDocument]:
