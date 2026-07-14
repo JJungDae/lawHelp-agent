@@ -10,7 +10,7 @@ from app.core.observability import (
     start_observation,
     summarize_documents,
 )
-from app.core.llm import generate_text
+from app.core.llm import LLM_FAILURE_MESSAGE, LLMError, generate_text
 from app.schemas.document import RetrievedDocument
 
 
@@ -113,10 +113,16 @@ def generate(state: AgentState) -> AgentState:
     if not documents:
         return fallback_response(state)
 
-    answer = generate_text(
-        prompt=_build_generation_prompt(state.get("message", ""), documents),
-        system=GENERATION_SYSTEM_PROMPT,
-    )
+    try:
+        answer = generate_text(
+            prompt=_build_generation_prompt(state.get("message", ""), documents),
+            system=GENERATION_SYSTEM_PROMPT,
+        )
+    except LLMError:
+        # 재시도·대체 모델 체인까지 전부 실패한 경우. 고정 문구는 LLM output이
+        # 아니므로 generation observation이 아닌 이 상위 계층에서 응답으로
+        # 변환한다 (Langfuse 유지 조건 7 — llm.py에서 반환하면 위반).
+        return _llm_failure_response(state)
 
     return {
         **state,
@@ -125,6 +131,19 @@ def generate(state: AgentState) -> AgentState:
         "guardrail_blocked": False,
         "is_fallback": False,
         "retrieved_count": len(documents),
+    }
+
+
+def _llm_failure_response(state: AgentState) -> AgentState:
+    """LLM 최종 실패 fallback — 공통_작업지시 6절의 'LLM 실패' 응답 계약."""
+    return {
+        **state,
+        "answer": LLM_FAILURE_MESSAGE,
+        "category": "기타",
+        "documents": [],
+        "guardrail_blocked": False,
+        "is_fallback": True,
+        "retrieved_count": 0,
     }
 
 
