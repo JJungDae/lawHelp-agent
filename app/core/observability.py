@@ -7,6 +7,7 @@ from typing import Any, Iterator, Optional
 from loguru import logger
 
 from app.core.config import settings
+from app.core.routing import EXACT_DISTANCE_THRESHOLD, RELATED_DISTANCE_THRESHOLD
 
 
 MAX_TRACE_TEXT_LENGTH = 1200
@@ -132,7 +133,46 @@ def build_trace_metadata(
     return metadata
 
 
+def build_route_trace_metadata(state: dict[str, Any]) -> dict[str, Any]:
+    response_type = response_type_from_state(state)
+    suggested_questions = state.get("suggested_questions") or []
+    metadata = {
+        "response_type": response_type,
+        "guardrail_result": guardrail_result_from_state(state),
+        "domain_category": state.get("domain_category"),
+        "guardrail_reason": state.get("guardrail_reason"),
+        "domain_keyword_hits": state.get("domain_keyword_hits", []),
+        "extended_domain_hits": state.get("extended_domain_hits", []),
+        "context_keyword_hits": state.get("context_keyword_hits", []),
+        "out_of_scope_hits": state.get("out_of_scope_hits", []),
+        "best_distance": state.get("best_distance"),
+        "top1_distance": state.get("top1_distance"),
+        "top2_distance": state.get("top2_distance"),
+        "top3_distance": state.get("top3_distance"),
+        "top1_document_id": state.get("top1_document_id"),
+        "top2_document_id": state.get("top2_document_id"),
+        "top3_document_id": state.get("top3_document_id"),
+        "exact_threshold": EXACT_DISTANCE_THRESHOLD,
+        "related_threshold": RELATED_DISTANCE_THRESHOLD,
+        "retrieved_count": state.get("retrieved_count", 0),
+        "exact_document_count": state.get("exact_document_count", 0),
+        "related_document_count": state.get("related_document_count", 0),
+        "grounded": state.get("is_grounded", False),
+        "llm_general_knowledge_used": response_type in {"related_hybrid", "llm_only"},
+        "suggestion_count": len(suggested_questions),
+    }
+
+    if "retry_used" in state:
+        metadata["retry_used"] = state["retry_used"]
+    if "model_fallback_used" in state:
+        metadata["model_fallback_used"] = state["model_fallback_used"]
+
+    return {key: value for key, value in metadata.items() if value is not None}
+
+
 def response_type_from_state(state: dict[str, Any]) -> str:
+    if state.get("response_type"):
+        return str(state["response_type"])
     if state.get("guardrail_blocked"):
         return "blocked"
     if state.get("is_fallback"):
@@ -141,6 +181,8 @@ def response_type_from_state(state: dict[str, Any]) -> str:
 
 
 def guardrail_result_from_state(state: dict[str, Any]) -> str:
+    if state.get("domain_guardrail_result"):
+        return str(state["domain_guardrail_result"])
     if state.get("guardrail_blocked"):
         return "blocked"
     if "guardrail_blocked" in state:

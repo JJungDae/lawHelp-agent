@@ -1,9 +1,12 @@
+import math
+import re
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Dict, Optional, TypedDict, Union
 
 from loguru import logger
 
+from app.agents.domain_guardrail import classify_domain
 from app.core.observability import (
     DEFAULT_TOP_K,
     mask_sensitive_text,
@@ -11,6 +14,12 @@ from app.core.observability import (
     summarize_documents,
 )
 from app.core.llm import LLM_FAILURE_MESSAGE, LLMError, generate_text
+from app.core.routing import (
+    EXACT_DISTANCE_THRESHOLD,
+    RELATED_DISTANCE_THRESHOLD,
+    AnswerRoute,
+    DomainGuardrailResult,
+)
 from app.schemas.document import RetrievedDocument
 
 
@@ -22,6 +31,16 @@ BLOCKED_ANSWER = (
 
 FALLBACK_ANSWER = "관련 정보를 충분히 찾지 못했습니다. 질문을 조금 더 구체적으로 입력해 주세요."
 LEGAL_NOTICE = "이 답변은 일반 정보 제공이며 법률 자문이 아닙니다."
+OUT_OF_SCOPE_ANSWER = (
+    "현재 서비스는 부동산/임대차와 복지 분야의 생활법률 정보만 안내합니다.\n"
+    "질문하신 내용은 현재 지원 범위 밖으로 판단되어 답변을 생성하지 않았습니다.\n"
+    "지원 분야에 해당하는 질문이라면 부동산/임대차 또는 복지 제도와 관련된 내용을 함께 입력해 주세요."
+)
+GENERAL_KNOWLEDGE_WARNING = (
+    "현재 보유한 생활법령 데이터에서 질문에 직접 대응하는 근거를 찾지 못해, "
+    "아래 안내는 Solar Pro 모델의 일반지식을 바탕으로 작성되었습니다. "
+    "정확하지 않거나 최신 제도와 다를 수 있으므로 공식 기관에서 다시 확인해 주세요."
+)
 GENERATION_SYSTEM_PROMPT = (
     "너는 법제처 생활법령 백문백답 기반 생활법률 안내 챗봇이다.\n"
     "규칙:\n"
@@ -33,11 +52,34 @@ GENERATION_SYSTEM_PROMPT = (
     "- 법률 용어는 한 줄 풀이를 덧붙인다.\n"
     "- 강한 지시보다 안내형 표현을 사용한다."
 )
+RELATED_HYBRID_SYSTEM_PROMPT = (
+    "너는 생활법률 안내 챗봇이다.\n"
+    "규칙:\n"
+    "- 현재 데이터셋에 직접 근거가 부족하다는 전제를 유지한다.\n"
+    "- 답변은 일반지식 기반의 제한적 안내로 작성한다.\n"
+    "- 실제 웹 검색을 한 것처럼 표현하지 않는다.\n"
+    "- URL, 출처 링크, 존재 여부를 확인하지 않은 기관명은 만들지 않는다.\n"
+    "- 최신 금액, 소득기준, 신청기한, 법 조문은 공식 확인이 필요하다고 안내한다.\n"
+    "- 확정적 법률 자문처럼 단정하지 않는다."
+)
+LLM_ONLY_SYSTEM_PROMPT = (
+    "너는 생활법률 안내 챗봇이다.\n"
+    "규칙:\n"
+    "- 답변은 일반지식 기반임을 전제로 한다.\n"
+    "- 구체 URL을 만들지 않는다.\n"
+    "- 최신 금액, 소득기준, 연령, 신청기한, 법 조문은 단정하지 않는다.\n"
+    "- 공식 기관 확인이 필요하다고 안내한다.\n"
+    "- 확정적 법률 자문처럼 표현하지 않는다."
+)
 # 고지문은 LLM에게 시키지 않고 코드가 부착한다 —
 # sync는 output_guardrail, stream은 chat.py의 tail 전송이 담당한다.
 # (본문 → 원문 링크 → 고지문 순서를 두 경로에서 동일하게 보장하기 위함)
 
 SOURCE_LINK_TEMPLATE = "더 도움이 필요하시면 {url} 에서 추가 정보를 확인할 수 있습니다."
+RELATED_SUGGESTION_INTRO = (
+    "현재 데이터에서 질문에 직접 답할 수 있는 자료는 찾지 못했지만, "
+    "아래 관련 주제는 생활법령 자료를 기반으로 안내할 수 있습니다."
+)
 
 DANGEROUS_PHRASES = (
     "승소",
@@ -61,10 +103,35 @@ class AgentState(TypedDict, total=False):
     thread_id: Optional[str]
     category: str
     documents: list[RetrievedDocument]
+    exact_documents: list[RetrievedDocument]
+    related_documents: list[RetrievedDocument]
+    out_of_range_documents: list[RetrievedDocument]
     answer: str
     guardrail_blocked: bool
     is_fallback: bool
     retrieved_count: int
+    response_type: str
+    warning: Optional[str]
+    suggested_questions: list[dict[str, str]]
+    sources: list[dict[str, str]]
+    is_grounded: bool
+    domain_guardrail_result: str
+    domain_category: str
+    guardrail_reason: str
+    domain_keyword_hits: list[str]
+    extended_domain_hits: list[str]
+    context_keyword_hits: list[str]
+    out_of_scope_hits: list[str]
+    best_distance: Optional[float]
+    top1_distance: Optional[float]
+    top2_distance: Optional[float]
+    top3_distance: Optional[float]
+    top1_document_id: Optional[str]
+    top2_document_id: Optional[str]
+    top3_document_id: Optional[str]
+    exact_document_count: int
+    related_document_count: int
+    use_raw_search: bool
 
 
 def scope_check(state: AgentState) -> AgentState:
@@ -90,13 +157,51 @@ def guardrail_exit(state: AgentState) -> AgentState:
         "guardrail_blocked": True,
         "is_fallback": False,
         "retrieved_count": 0,
+        "response_type": AnswerRoute.OUT_OF_SCOPE.value,
+        "is_grounded": False,
+    }
+
+
+def domain_guardrail(state: AgentState) -> AgentState:
+    message = state.get("message", "")
+    started_at = perf_counter()
+    decision = classify_domain(message)
+    _record_domain_guardrail_trace(message, decision, _duration_ms(started_at))
+
+    return {
+        **state,
+        "domain_guardrail_result": decision.result.value,
+        "domain_category": decision.domain_category,
+        "guardrail_reason": decision.reason,
+        "domain_keyword_hits": list(decision.domain_keyword_hits),
+        "extended_domain_hits": list(decision.extended_domain_hits),
+        "context_keyword_hits": list(decision.context_keyword_hits),
+        "out_of_scope_hits": list(decision.out_of_scope_hits),
+    }
+
+
+def out_of_scope_response(state: AgentState) -> AgentState:
+    return {
+        **state,
+        "answer": OUT_OF_SCOPE_ANSWER,
+        "category": "지원범위밖",
+        "documents": state.get("documents", []),
+        "guardrail_blocked": True,
+        "is_fallback": False,
+        "retrieved_count": state.get("retrieved_count", 0),
+        "response_type": AnswerRoute.OUT_OF_SCOPE.value,
+        "warning": None,
+        "suggested_questions": [],
+        "sources": [],
+        "is_grounded": False,
     }
 
 
 def retrieve(state: AgentState) -> AgentState:
     message = state.get("message", "")
     started_at = perf_counter()
-    documents = _search_law_qa(message)
+    search = _search_law_qa_raw if state.get("use_raw_search") else _search_law_qa
+    documents = search(message)
     _record_retrieval_trace(message, documents, _duration_ms(started_at))
     category = documents[0].category if documents else "기타"
 
@@ -108,16 +213,82 @@ def retrieve(state: AgentState) -> AgentState:
     }
 
 
-def generate(state: AgentState) -> AgentState:
+def decide_route(state: AgentState) -> AgentState:
     documents = state.get("documents", [])
-    if not documents:
+    exact_documents, related_documents, out_of_range_documents = _split_documents_by_distance(
+        documents
+    )
+    best_distance = _best_distance(documents)
+    top_k_summary = _top_k_summary(documents)
+    guardrail_result = state.get("domain_guardrail_result", DomainGuardrailResult.UNCERTAIN.value)
+    guardrail_reason = state.get("guardrail_reason", "uncertain")
+
+    if guardrail_result == DomainGuardrailResult.UNCERTAIN.value:
+        if best_distance is not None and best_distance <= RELATED_DISTANCE_THRESHOLD:
+            guardrail_result = DomainGuardrailResult.IN_SCOPE.value
+            guardrail_reason = "uncertain_vector_pass"
+        else:
+            guardrail_result = DomainGuardrailResult.OUT_OF_SCOPE.value
+            guardrail_reason = "uncertain_vector_fail"
+
+    if guardrail_result == DomainGuardrailResult.OUT_OF_SCOPE.value:
+        route = AnswerRoute.OUT_OF_SCOPE
+        routed_documents: list[RetrievedDocument] = []
+    elif exact_documents:
+        route = AnswerRoute.GROUNDED_RAG
+        routed_documents = exact_documents
+    elif related_documents:
+        route = AnswerRoute.RELATED_HYBRID
+        routed_documents = related_documents
+    else:
+        route = AnswerRoute.LLM_ONLY
+        routed_documents = []
+
+    suggested_questions = _build_suggested_questions(related_documents, state.get("message", ""))
+    _record_route_decision_trace(
+        route=route,
+        state=state,
+        guardrail_result=guardrail_result,
+        guardrail_reason=guardrail_reason,
+        best_distance=best_distance,
+        exact_count=len(exact_documents),
+        related_count=len(related_documents),
+        suggestion_count=len(suggested_questions),
+        top_k_summary=top_k_summary,
+    )
+
+    return {
+        **state,
+        "documents": routed_documents,
+        "exact_documents": exact_documents,
+        "related_documents": related_documents,
+        "out_of_range_documents": out_of_range_documents,
+        "domain_guardrail_result": guardrail_result,
+        "guardrail_reason": guardrail_reason,
+        "best_distance": best_distance,
+        **top_k_summary,
+        "exact_document_count": len(exact_documents),
+        "related_document_count": len(related_documents),
+        "response_type": route.value,
+        "is_grounded": route == AnswerRoute.GROUNDED_RAG,
+        "suggested_questions": suggested_questions,
+        "warning": GENERAL_KNOWLEDGE_WARNING
+        if route in {AnswerRoute.RELATED_HYBRID, AnswerRoute.LLM_ONLY}
+        else None,
+        "sources": _build_sources(exact_documents) if route == AnswerRoute.GROUNDED_RAG else [],
+    }
+
+
+def generate(state: AgentState) -> AgentState:
+    route = state.get("response_type", AnswerRoute.GROUNDED_RAG.value)
+    documents = state.get("documents", [])
+    if route == AnswerRoute.OUT_OF_SCOPE.value:
+        return out_of_scope_response(state)
+    if route == AnswerRoute.GROUNDED_RAG.value and not documents:
         return fallback_response(state)
 
     try:
-        answer = generate_text(
-            prompt=_build_generation_prompt(state.get("message", ""), documents),
-            system=GENERATION_SYSTEM_PROMPT,
-        )
+        answer = _generate_by_route(state, route, documents)
     except LLMError:
         # 재시도·대체 모델 체인까지 전부 실패한 경우. 고정 문구는 LLM output이
         # 아니므로 generation observation이 아닌 이 상위 계층에서 응답으로
@@ -127,7 +298,7 @@ def generate(state: AgentState) -> AgentState:
     return {
         **state,
         "answer": answer,
-        "category": documents[0].category,
+        "category": documents[0].category if documents else _category_from_domain(state),
         "guardrail_blocked": False,
         "is_fallback": False,
         "retrieved_count": len(documents),
@@ -144,6 +315,8 @@ def _llm_failure_response(state: AgentState) -> AgentState:
         "guardrail_blocked": False,
         "is_fallback": True,
         "retrieved_count": 0,
+        "response_type": AnswerRoute.ERROR.value,
+        "is_grounded": False,
     }
 
 
@@ -155,6 +328,8 @@ def build_source_link_line(documents: list[RetrievedDocument]) -> Optional[str]:
     """
     if not documents:
         return None
+    if documents[0].source_url:
+        return SOURCE_LINK_TEMPLATE.format(url=documents[0].source_url)
     try:
         from app.repositories.chroma_law_repository import get_source_url
 
@@ -171,16 +346,29 @@ def output_guardrail(state: AgentState) -> AgentState:
     if state.get("guardrail_blocked") or state.get("is_fallback"):
         return state
 
+    route = state.get("response_type", AnswerRoute.GROUNDED_RAG.value)
     answer = state.get("answer", "").strip()
     # 본문 → 링크 → 고지문 순서를 보장하기 위해, LLM이 임의로 넣은 고지문은
     # 떼어낸 뒤 마지막에 다시 부착한다.
     if LEGAL_NOTICE in answer:
         answer = answer.replace(LEGAL_NOTICE, "").strip()
 
-    parts = [answer]
-    link_line = build_source_link_line(state.get("documents", []))
-    if link_line:
-        parts.append(link_line)
+    if route in {AnswerRoute.RELATED_HYBRID.value, AnswerRoute.LLM_ONLY.value}:
+        answer = _strip_unverified_urls(answer)
+        parts = []
+        warning = state.get("warning") or GENERAL_KNOWLEDGE_WARNING
+        parts.append(warning)
+        if answer:
+            parts.append(answer)
+        parts.append(_official_institution_line(state.get("domain_category", "unknown")))
+        suggestion_text = _format_suggested_questions(state.get("suggested_questions", []))
+        if suggestion_text:
+            parts.append(suggestion_text)
+    else:
+        parts = [answer]
+        link_line = build_source_link_line(state.get("documents", []))
+        if link_line:
+            parts.append(link_line)
     parts.append(LEGAL_NOTICE)
 
     return {
@@ -188,6 +376,8 @@ def output_guardrail(state: AgentState) -> AgentState:
         "answer": "\n\n".join(parts),
         "guardrail_blocked": False,
         "is_fallback": False,
+        "warning": state.get("warning"),
+        "sources": _build_sources(state.get("documents", [])) if route == AnswerRoute.GROUNDED_RAG.value else [],
     }
 
 
@@ -200,7 +390,169 @@ def fallback_response(state: AgentState) -> AgentState:
         "guardrail_blocked": False,
         "is_fallback": True,
         "retrieved_count": 0,
+        "response_type": AnswerRoute.ERROR.value,
+        "is_grounded": False,
     }
+
+
+def _generate_by_route(
+    state: AgentState,
+    route: str,
+    documents: list[RetrievedDocument],
+) -> str:
+    message = state.get("message", "")
+    if route == AnswerRoute.RELATED_HYBRID.value:
+        return generate_text(
+            prompt=_build_related_hybrid_prompt(message, documents),
+            system=RELATED_HYBRID_SYSTEM_PROMPT,
+        )
+    if route == AnswerRoute.LLM_ONLY.value:
+        return generate_text(
+            prompt=_build_llm_only_prompt(message, state.get("domain_category", "unknown")),
+            system=LLM_ONLY_SYSTEM_PROMPT,
+        )
+    return generate_text(
+        prompt=_build_generation_prompt(message, documents),
+        system=GENERATION_SYSTEM_PROMPT,
+    )
+
+
+def _split_documents_by_distance(
+    documents: list[RetrievedDocument],
+) -> tuple[list[RetrievedDocument], list[RetrievedDocument], list[RetrievedDocument]]:
+    exact_documents = []
+    related_documents = []
+    out_of_range_documents = []
+
+    for document in documents:
+        distance = _valid_distance(document)
+        if distance is None:
+            out_of_range_documents.append(document)
+        elif distance <= EXACT_DISTANCE_THRESHOLD:
+            exact_documents.append(document)
+        elif distance <= RELATED_DISTANCE_THRESHOLD:
+            related_documents.append(document)
+        else:
+            out_of_range_documents.append(document)
+
+    return exact_documents, related_documents, out_of_range_documents
+
+
+def _best_distance(documents: list[RetrievedDocument]) -> Optional[float]:
+    distances = [
+        distance for document in documents if (distance := _valid_distance(document)) is not None
+    ]
+    if not distances:
+        return None
+    return min(distances)
+
+
+def _top_k_summary(documents: list[RetrievedDocument]) -> dict[str, Optional[float] | Optional[str]]:
+    summary: dict[str, Optional[float] | Optional[str]] = {
+        "top1_distance": None,
+        "top2_distance": None,
+        "top3_distance": None,
+        "top1_document_id": None,
+        "top2_document_id": None,
+        "top3_document_id": None,
+    }
+    for index, document in enumerate(documents[:DEFAULT_TOP_K], start=1):
+        summary[f"top{index}_distance"] = _valid_distance(document)
+        summary[f"top{index}_document_id"] = document.id
+    return summary
+
+
+def _valid_distance(document: RetrievedDocument) -> Optional[float]:
+    distance = document.distance
+    if distance is None or not isinstance(distance, (int, float)):
+        return None
+    if math.isnan(float(distance)):
+        return None
+    return float(distance)
+
+
+def _build_suggested_questions(
+    documents: list[RetrievedDocument],
+    original_question: str,
+    limit: int = 3,
+) -> list[dict[str, str]]:
+    normalized_original = _normalize_for_compare(original_question)
+    suggestions = []
+    seen = set()
+    for document in documents:
+        question = document.question.strip()
+        normalized_question = _normalize_for_compare(question)
+        if not question or normalized_question == normalized_original or normalized_question in seen:
+            continue
+        seen.add(normalized_question)
+        suggestions.append(
+            {
+                "source_document_id": document.id,
+                "source_question": question,
+                "suggested_question": question,
+            }
+        )
+        if len(suggestions) >= limit:
+            break
+    return suggestions
+
+
+def _normalize_for_compare(text: str) -> str:
+    return re.sub(r"\s+", "", text.casefold())
+
+
+def _format_suggested_questions(suggested_questions: list[dict[str, str]]) -> Optional[str]:
+    if not suggested_questions:
+        return None
+    lines = [RELATED_SUGGESTION_INTRO]
+    lines.extend(f"- {item['suggested_question']}" for item in suggested_questions)
+    return "\n".join(lines)
+
+
+def _official_institution_line(domain_category: str) -> str:
+    institutions = _official_institutions(domain_category)
+    if not institutions:
+        return "정확한 적용 여부는 거주지 주민센터 또는 해당 제도의 담당 공공기관에 확인해 주세요."
+    return f"정확한 적용 여부는 {' 또는 '.join(institutions)}에 확인해 주세요."
+
+
+def _official_institutions(domain_category: str) -> list[str]:
+    if domain_category == "real_estate_rental":
+        return ["법제처 찾기 쉬운 생활법령정보", "국토교통부"]
+    if domain_category == "welfare":
+        return ["보건복지부", "복지로"]
+    if domain_category == "mixed":
+        return ["법제처 찾기 쉬운 생활법령정보", "거주지 읍·면·동 주민센터"]
+    return []
+
+
+def _strip_unverified_urls(text: str) -> str:
+    return re.sub(r"https?://\S+", "[검증되지 않은 URL 제거]", text)
+
+
+def _build_sources(documents: list[RetrievedDocument]) -> list[dict[str, str]]:
+    sources = []
+    for document in documents:
+        source = {
+            "id": document.id,
+            "question": document.question,
+            "category": document.category,
+        }
+        if document.source_url:
+            source["source_url"] = document.source_url
+        sources.append(source)
+    return sources
+
+
+def _category_from_domain(state: AgentState) -> str:
+    domain_category = state.get("domain_category")
+    if domain_category == "real_estate_rental":
+        return "부동산/임대차"
+    if domain_category == "welfare":
+        return "복지"
+    if domain_category == "mixed":
+        return "혼합"
+    return "기타"
 
 
 def _record_guardrail_trace(message: str, is_blocked: bool, duration_ms: float) -> None:
@@ -214,6 +566,24 @@ def _record_guardrail_trace(message: str, is_blocked: bool, duration_ms: float) 
             output={"result": "blocked" if is_blocked else "allow"},
             metadata={"reason": "dangerous_phrase" if is_blocked else "none"},
         )
+
+
+def _record_domain_guardrail_trace(message: str, decision, duration_ms: float) -> None:
+    with start_observation(
+        name="domain_guardrail",
+        as_type="guardrail",
+        input={"question": mask_sensitive_text(message)},
+        metadata={
+            "duration_ms": duration_ms,
+            "domain_category": decision.domain_category,
+            "guardrail_reason": decision.reason,
+            "domain_keyword_hits": list(decision.domain_keyword_hits),
+            "extended_domain_hits": list(decision.extended_domain_hits),
+            "context_keyword_hits": list(decision.context_keyword_hits),
+            "out_of_scope_hits": list(decision.out_of_scope_hits),
+        },
+    ) as observation:
+        observation.update(output={"result": decision.result.value})
 
 
 def _record_retrieval_trace(
@@ -239,6 +609,52 @@ def _record_retrieval_trace(
         )
 
 
+def _record_route_decision_trace(
+    *,
+    route: AnswerRoute,
+    state: AgentState,
+    guardrail_result: str,
+    guardrail_reason: str,
+    best_distance: Optional[float],
+    exact_count: int,
+    related_count: int,
+    suggestion_count: int,
+    top_k_summary: dict[str, Optional[float] | Optional[str]],
+) -> None:
+    with start_observation(
+        name="route_decision",
+        as_type="span",
+        input={
+            "guardrail_result": guardrail_result,
+            "retrieved_count": state.get("retrieved_count", 0),
+        },
+        metadata={
+            "response_type": route.value,
+            "domain_category": state.get("domain_category", "unknown"),
+            "guardrail_reason": guardrail_reason,
+            "domain_keyword_hits": state.get("domain_keyword_hits", []),
+            "context_keyword_hits": state.get("context_keyword_hits", []),
+            "best_distance": best_distance,
+            "top1_distance": top_k_summary["top1_distance"],
+            "top2_distance": top_k_summary["top2_distance"],
+            "top3_distance": top_k_summary["top3_distance"],
+            "top1_document_id": top_k_summary["top1_document_id"],
+            "top2_document_id": top_k_summary["top2_document_id"],
+            "top3_document_id": top_k_summary["top3_document_id"],
+            "exact_threshold": EXACT_DISTANCE_THRESHOLD,
+            "related_threshold": RELATED_DISTANCE_THRESHOLD,
+            "retrieved_count": state.get("retrieved_count", 0),
+            "exact_document_count": exact_count,
+            "related_document_count": related_count,
+            "grounded": route == AnswerRoute.GROUNDED_RAG,
+            "llm_general_knowledge_used": route
+            in {AnswerRoute.RELATED_HYBRID, AnswerRoute.LLM_ONLY},
+            "suggestion_count": suggestion_count,
+        },
+    ) as observation:
+        observation.update(output={"route": route.value})
+
+
 def _duration_ms(started_at: float) -> float:
     return round((perf_counter() - started_at) * 1000, 2)
 
@@ -258,12 +674,37 @@ def _search_law_qa(query: str) -> list[RetrievedDocument]:
 
     from app.repositories.mock_law_repository import search_law_qa
 
-    return [_coerce_document(document) for document in search_law_qa(query)]
+    return [_coerce_document(document, default_distance=0.0) for document in search_law_qa(query)]
 
 
-def _coerce_document(document: Union[RetrievedDocument, Dict[str, Any]]) -> RetrievedDocument:
+def _search_law_qa_raw(query: str) -> list[RetrievedDocument]:
+    repositories_dir = Path(__file__).resolve().parents[1] / "repositories"
+
+    chroma_repository_path = repositories_dir / "chroma_law_repository.py"
+    if chroma_repository_path.exists():
+        from app.repositories.chroma_law_repository import search_law_qa_raw
+
+        return [_coerce_document(document) for document in search_law_qa_raw(query)]
+
+    mock_repository_path = repositories_dir / "mock_law_repository.py"
+    if not mock_repository_path.exists():
+        return _temporary_search_law_qa(query)
+
+    from app.repositories.mock_law_repository import search_law_qa
+
+    return [_coerce_document(document, default_distance=0.0) for document in search_law_qa(query)]
+
+
+def _coerce_document(
+    document: Union[RetrievedDocument, Dict[str, Any]],
+    default_distance: Optional[float] = None,
+) -> RetrievedDocument:
     if isinstance(document, RetrievedDocument):
+        if document.distance is None and default_distance is not None:
+            return document.model_copy(update={"distance": default_distance})
         return document
+    if "distance" not in document and default_distance is not None:
+        document = {**document, "distance": default_distance}
     return RetrievedDocument(**document)
 
 
@@ -361,4 +802,40 @@ def _build_generation_prompt(message: str, documents: list[RetrievedDocument]) -
         "2. 관련 제도/권리\n"
         "3. 다음 행동\n"
         "4. 일반 정보 제공 고지"
+    )
+
+
+def _build_related_hybrid_prompt(message: str, documents: list[RetrievedDocument]) -> str:
+    related_questions = "\n".join(
+        f"- {document.question}" for document in documents[:DEFAULT_TOP_K]
+    )
+    return (
+        "[사용자 질문]\n"
+        f"{message}\n\n"
+        "[상황]\n"
+        "현재 데이터셋에서 직접 근거로 사용할 문서는 찾지 못했다.\n"
+        "아래 문서는 관련 주제 추천에만 사용하고, 사용자 질문의 근거로 단정하지 않는다.\n\n"
+        "[관련 주제 후보]\n"
+        f"{related_questions or '- 없음'}\n\n"
+        "[답변 지시]\n"
+        "1. 데이터 근거가 부족하다는 전제를 유지한다.\n"
+        "2. 일반지식 기반으로 사용자가 확인할 방향을 안내한다.\n"
+        "3. URL을 만들지 않는다.\n"
+        "4. 최신 기준은 공식 기관 확인이 필요하다고 안내한다."
+    )
+
+
+def _build_llm_only_prompt(message: str, domain_category: str) -> str:
+    return (
+        "[사용자 질문]\n"
+        f"{message}\n\n"
+        "[지원 분야]\n"
+        f"{domain_category}\n\n"
+        "[상황]\n"
+        "현재 데이터셋에서 질문에 대응하는 근거 문서를 찾지 못했다.\n\n"
+        "[답변 지시]\n"
+        "1. 일반지식 기반의 제한적 안내로 작성한다.\n"
+        "2. 구체 URL을 만들지 않는다.\n"
+        "3. 최신 금액, 소득기준, 신청기한, 법 조문은 공식 확인이 필요하다고 안내한다.\n"
+        "4. 확정적 법률 자문처럼 단정하지 않는다."
     )

@@ -35,6 +35,7 @@ def test_chat_sync_normal_question():
     assert data["is_fallback"] is False
     assert data["retrieved_count"] >= 1
     assert data["category"] == "임대차"
+    assert data["response_type"] == "grounded_rag"
     assert "이 답변은 일반 정보 제공이며 법률 자문이 아닙니다." in data["answer"]
 
 
@@ -51,6 +52,7 @@ def test_chat_sync_blocked_question():
     assert data["guardrail_blocked"] is True
     assert data["is_fallback"] is False
     assert data["retrieved_count"] == 0
+    assert data["response_type"] == "out_of_scope"
 
 
 def test_chat_sync_should_not_overblock_contract_question():
@@ -74,7 +76,8 @@ def test_chat_sync_no_result_fallback():
     data = response.json()
 
     assert response.status_code == 200
-    assert data["category"] == "기타"
-    assert data["guardrail_blocked"] is False
-    assert data["is_fallback"] is True
+    assert data["category"] == "지원범위밖"
+    assert data["guardrail_blocked"] is True
+    assert data["is_fallback"] is False
     assert data["retrieved_count"] == 0
+    assert data["response_type"] == "out_of_scope"
