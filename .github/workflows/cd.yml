@@ -26,9 +26,24 @@ jobs:
             git pull --ff-only origin main
 
             df -h /
+            df -i /
             docker system df || true
+
+            docker compose down || true
+            docker container prune -f || true
             docker builder prune -af || true
             docker image prune -af || true
+
+            AVAILABLE_KB=$(df --output=avail / | tail -n1 | tr -d ' ')
+            MIN_KB=$((5 * 1024 * 1024))
+            if [ "$AVAILABLE_KB" -lt "$MIN_KB" ]; then
+              echo "Still low on disk after prune:"
+              df -h /
+              df -i /
+              docker system df || true
+              echo "Increase VM disk size or clean up the deployment instance manually."
+              exit 1
+            fi
 
             docker compose build api frontend
 
