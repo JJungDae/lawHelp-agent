@@ -51,6 +51,7 @@ def _fake_documents():
             category="임대차",
             question="월세 계약 전에 무엇을 확인해야 하나요?",
             answer="등기부등본과 계약 상대방을 확인합니다.",
+            distance=0.4,
         )
     ]
 
@@ -86,6 +87,7 @@ def fake_completion(monkeypatch):
 
 def test_langfuse_disabled_does_not_break_sync(monkeypatch, fake_completion):
     monkeypatch.setattr("app.agents.nodes._search_law_qa", lambda query: _fake_documents())
+    monkeypatch.setattr("app.agents.nodes._search_law_qa_raw", lambda query: _fake_documents())
     monkeypatch.setattr(observability, "_get_langfuse_client", lambda: None)
 
     response = client.post("/chat/sync", json={"message": "월세 계약 전에 확인할 점은?"})
@@ -115,6 +117,7 @@ def test_chat_sync_records_request_guardrail_retrieval_and_generation(
     fake_completion,
 ):
     monkeypatch.setattr("app.agents.nodes._search_law_qa", lambda query: _fake_documents())
+    monkeypatch.setattr("app.agents.nodes._search_law_qa_raw", lambda query: _fake_documents())
 
     response = client.post("/chat/sync", json={"message": "월세 계약 전에 확인할 점은?"})
 
@@ -129,8 +132,16 @@ def test_chat_sync_records_request_guardrail_retrieval_and_generation(
         record for record in fake_langfuse.records if record["kwargs"]["name"] == "law-help-chat-sync"
     )
     root_update = root_record["updates"][-1]
-    assert root_update["metadata"]["response_type"] == "normal"
+    assert root_update["metadata"]["response_type"] == "grounded_rag"
     assert root_update["metadata"]["retrieved_count"] == 1
+    assert root_update["metadata"]["best_distance"] == 0.4
+    assert root_update["metadata"]["exact_threshold"] == 0.45
+    assert root_update["metadata"]["related_threshold"] == 0.59
+    assert root_update["metadata"]["exact_document_count"] == 1
+    assert root_update["metadata"]["related_document_count"] == 0
+    assert root_update["metadata"]["grounded"] is True
+    assert root_update["metadata"]["llm_general_knowledge_used"] is False
+    assert root_update["metadata"]["suggestion_count"] == 0
 
     generation_record = next(
         record for record in fake_langfuse.records if record["kwargs"]["name"] == "generation"
@@ -147,6 +158,7 @@ def test_blocked_sync_does_not_run_retrieval_or_generation(monkeypatch, fake_lan
         raise AssertionError("retrieval should not run for blocked input")
 
     monkeypatch.setattr("app.agents.nodes._search_law_qa", fail_search)
+    monkeypatch.setattr("app.agents.nodes._search_law_qa_raw", fail_search)
 
     response = client.post("/chat/sync", json={"message": DANGEROUS_PHRASES[0]})
 
@@ -161,7 +173,7 @@ def test_blocked_sync_does_not_run_retrieval_or_generation(monkeypatch, fake_lan
         record for record in fake_langfuse.records if record["kwargs"]["name"] == "law-help-chat-sync"
     )
     root_update = root_record["updates"][-1]
-    assert root_update["metadata"]["response_type"] == "blocked"
+    assert root_update["metadata"]["response_type"] == "out_of_scope"
 
 
 def test_no_result_sync_records_no_result(monkeypatch, fake_langfuse):
@@ -169,6 +181,7 @@ def test_no_result_sync_records_no_result(monkeypatch, fake_langfuse):
         raise AssertionError("generation should not run without retrieved documents")
 
     monkeypatch.setattr("app.agents.nodes._search_law_qa", lambda query: [])
+    monkeypatch.setattr("app.agents.nodes._search_law_qa_raw", lambda query: [])
     monkeypatch.setattr("app.core.llm._completion", fail_completion)
 
     response = client.post("/chat/sync", json={"message": "관련 없는 질문"})
@@ -182,11 +195,12 @@ def test_no_result_sync_records_no_result(monkeypatch, fake_langfuse):
         record for record in fake_langfuse.records if record["kwargs"]["name"] == "law-help-chat-sync"
     )
     root_update = root_record["updates"][-1]
-    assert root_update["metadata"]["response_type"] == "no_result"
+    assert root_update["metadata"]["response_type"] == "out_of_scope"
 
 
 def test_chat_stream_records_final_output(monkeypatch, fake_langfuse, fake_completion):
     monkeypatch.setattr("app.agents.nodes._search_law_qa", lambda query: _fake_documents())
+    monkeypatch.setattr("app.agents.nodes._search_law_qa_raw", lambda query: _fake_documents())
 
     response = client.post("/chat/stream", json={"message": "월세 계약 전에 확인할 점은?"})
 
@@ -197,7 +211,10 @@ def test_chat_stream_records_final_output(monkeypatch, fake_langfuse, fake_compl
         record for record in fake_langfuse.records if record["kwargs"]["name"] == "law-help-chat-stream"
     )
     root_update = root_record["updates"][-1]
-    assert root_update["metadata"]["response_type"] == "normal"
+    assert root_update["metadata"]["response_type"] == "grounded_rag"
+    assert root_update["metadata"]["best_distance"] == 0.4
+    assert root_update["metadata"]["grounded"] is True
+    assert root_update["metadata"]["llm_general_knowledge_used"] is False
     assert "첫 응답" in root_update["output"]["answer"]
 
 

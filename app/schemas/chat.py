@@ -14,3 +14,8 @@ class ChatResponse(BaseModel):
     guardrail_blocked: bool = False
     is_fallback: bool = False
     retrieved_count: int = 0
+    response_type: str = "normal"
+    warning: Optional[str] = None
+    suggested_questions: list[dict[str, str]] = Field(default_factory=list)
+    sources: list[dict[str, str]] = Field(default_factory=list)
+    is_grounded: bool = False

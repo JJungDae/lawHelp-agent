@@ -2,15 +2,18 @@ from typing import Any, Optional
 
 from app.agents.nodes import (
     AgentState,
-    fallback_response,
+    decide_route,
+    domain_guardrail,
     generate,
     guardrail_exit,
     output_guardrail,
+    out_of_scope_response,
     retrieve,
     scope_check,
 )
 from app.core.observability import (
     add_trace_attributes,
+    build_route_trace_metadata,
     build_trace_metadata,
     guardrail_result_from_state,
     mask_sensitive_text,
@@ -19,6 +22,7 @@ from app.core.observability import (
     trace_tags,
 )
 from app.schemas.chat import ChatResponse
+from app.core.routing import AnswerRoute, DomainGuardrailResult
 
 
 _COMPILED_WORKFLOW: Optional[Any] = None
@@ -35,6 +39,11 @@ def run_chat_workflow(message: str, thread_id: Optional[str] = None) -> ChatResp
         "guardrail_blocked": False,
         "is_fallback": False,
         "retrieved_count": 0,
+        "response_type": "pending",
+        "suggested_questions": [],
+        "sources": [],
+        "is_grounded": False,
+        "use_raw_search": True,
     }
 
     with start_trace(
@@ -79,14 +88,17 @@ def run_chat_workflow(message: str, thread_id: Optional[str] = None) -> ChatResp
                 "response_type": response_type,
                 "answer": response.answer,
             },
-            metadata=build_trace_metadata(
-                endpoint=SYNC_ENDPOINT,
-                mode="sync",
-                guardrail_result=guardrail_result_from_state(final_state),
-                retrieved_count=final_state.get("retrieved_count", 0),
-                response_type=response_type,
-                success=True,
-            ),
+            metadata={
+                **build_trace_metadata(
+                    endpoint=SYNC_ENDPOINT,
+                    mode="sync",
+                    guardrail_result=guardrail_result_from_state(final_state),
+                    retrieved_count=final_state.get("retrieved_count", 0),
+                    response_type=response_type,
+                    success=True,
+                ),
+                **build_route_trace_metadata(final_state),
+            },
         )
         return response
 
@@ -104,8 +116,7 @@ def _get_compiled_workflow() -> Optional[Any]:
     graph = StateGraph(AgentState)
     graph.add_node("scope_check", scope_check)
     graph.add_node("guardrail_exit", guardrail_exit)
-    graph.add_node("retrieve", retrieve)
-    graph.add_node("fallback_response", fallback_response)
+    graph.add_node("prepare_routing", prepare_routing_state)
     graph.add_node("generate", generate)
     graph.add_node("output_guardrail", output_guardrail)
 
@@ -115,20 +126,19 @@ def _get_compiled_workflow() -> Optional[Any]:
         _route_after_scope_check,
         {
             "blocked": "guardrail_exit",
-            "passed": "retrieve",
+            "passed": "prepare_routing",
         },
     )
     graph.add_conditional_edges(
-        "retrieve",
-        _route_after_retrieve,
+        "prepare_routing",
+        _route_after_decision,
         {
-            "found": "generate",
-            "no_result": "fallback_response",
+            "out_of_scope": END,
+            "generate": "generate",
         },
     )
     graph.add_edge("generate", "output_guardrail")
     graph.add_edge("guardrail_exit", END)
-    graph.add_edge("fallback_response", END)
     graph.add_edge("output_guardrail", END)
 
     _COMPILED_WORKFLOW = graph.compile()
@@ -140,20 +150,45 @@ def _run_function_chain(state: AgentState) -> AgentState:
     if state.get("guardrail_blocked"):
         return guardrail_exit(state)
 
-    state = retrieve(state)
-    if state.get("retrieved_count", 0) == 0:
-        return fallback_response(state)
+    state = prepare_routing_state(state)
+    if _route_after_decision(state) == "out_of_scope":
+        return state
 
     state = generate(state)
     return output_guardrail(state)
+
+
+def prepare_routing_state(state: AgentState) -> AgentState:
+    state = domain_guardrail(state)
+    if _route_after_domain_guardrail(state) == "out_of_scope":
+        return out_of_scope_response(state)
+
+    state = retrieve(state)
+    state = decide_route(state)
+    if _route_after_decision(state) == "out_of_scope":
+        return out_of_scope_response(state)
+
+    return state
 
 
 def _route_after_scope_check(state: AgentState) -> str:
     return "blocked" if state.get("guardrail_blocked") else "passed"
 
 
-def _route_after_retrieve(state: AgentState) -> str:
-    return "found" if state.get("retrieved_count", 0) > 0 else "no_result"
+def _route_after_domain_guardrail(state: AgentState) -> str:
+    return (
+        "out_of_scope"
+        if state.get("domain_guardrail_result") == DomainGuardrailResult.OUT_OF_SCOPE.value
+        else "search"
+    )
+
+
+def _route_after_decision(state: AgentState) -> str:
+    return (
+        "out_of_scope"
+        if state.get("response_type") == AnswerRoute.OUT_OF_SCOPE.value
+        else "generate"
+    )
 
 
 def _to_chat_response(state: AgentState) -> ChatResponse:
@@ -163,4 +198,9 @@ def _to_chat_response(state: AgentState) -> ChatResponse:
         guardrail_blocked=state.get("guardrail_blocked", False),
         is_fallback=state.get("is_fallback", False),
         retrieved_count=state.get("retrieved_count", 0),
+        response_type=state.get("response_type", "normal"),
+        warning=state.get("warning"),
+        suggested_questions=state.get("suggested_questions", []),
+        sources=state.get("sources", []),
+        is_grounded=state.get("is_grounded", False),
     )
