@@ -203,4 +203,22 @@ def _to_chat_response(state: AgentState) -> ChatResponse:
         suggested_questions=state.get("suggested_questions", []),
         sources=state.get("sources", []),
         is_grounded=state.get("is_grounded", False),
+        top_documents=_top_documents_from_state(state),
     )
+
+
+def _top_documents_from_state(state: AgentState) -> list[dict]:
+    """decide_route가 원시 검색 결과로 채운 top1~3 state 필드를 평가용으로 노출한다.
+
+    검색이 실행되지 않은 경로(scope_check 차단, explicit_out_of_scope)는 해당
+    필드가 없어 빈 리스트가 된다. uncertain_vector_fail 차단은 검색이 1회
+    실행되므로 결과가 남는다 (distance 분포 수집용 — 평가 작업지시 2절).
+    """
+    top_documents: list[dict] = []
+    for rank in (1, 2, 3):
+        document_id = state.get(f"top{rank}_document_id")
+        distance = state.get(f"top{rank}_distance")
+        if document_id is None or distance is None:
+            continue
+        top_documents.append({"id": document_id, "distance": round(float(distance), 4)})
+    return top_documents

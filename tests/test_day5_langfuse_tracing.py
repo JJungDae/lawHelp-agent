@@ -135,8 +135,10 @@ def test_chat_sync_records_request_guardrail_retrieval_and_generation(
     assert root_update["metadata"]["response_type"] == "grounded_rag"
     assert root_update["metadata"]["retrieved_count"] == 1
     assert root_update["metadata"]["best_distance"] == 0.4
-    assert root_update["metadata"]["exact_threshold"] == 0.45
-    assert root_update["metadata"]["related_threshold"] == 0.59
+    from app.core.routing import EXACT_DISTANCE_THRESHOLD, RELATED_DISTANCE_THRESHOLD
+
+    assert root_update["metadata"]["exact_threshold"] == EXACT_DISTANCE_THRESHOLD
+    assert root_update["metadata"]["related_threshold"] == RELATED_DISTANCE_THRESHOLD
     assert root_update["metadata"]["exact_document_count"] == 1
     assert root_update["metadata"]["related_document_count"] == 0
     assert root_update["metadata"]["grounded"] is True
