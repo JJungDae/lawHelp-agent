@@ -19,3 +19,5 @@ class ChatResponse(BaseModel):
     suggested_questions: list[dict[str, str]] = Field(default_factory=list)
     sources: list[dict[str, str]] = Field(default_factory=list)
     is_grounded: bool = False
+    # 평가(Hit@3)용 원시 검색 top-3 (라우팅 채택 여부와 무관). 검색 미실행 경로는 빈 리스트.
+    top_documents: list[dict] = Field(default_factory=list)
