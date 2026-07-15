@@ -59,7 +59,8 @@ LawHelp는 질문 처리 흐름을 단순 RAG 호출이 아니라 단계별 Agen
 
 ## 5. 데모 영상
 
-추후 추가 예정입니다.
+데모 영상: `https://drive.google.com/file/d/1GgplS6b5uRy2WHCrbORkf0x9PsKjxV4V/view?usp=drive_link`
+배포 URL: `http://8.230.11.213:8501/`
 
 ## 6. 팀원 소개
 
@@ -68,12 +69,12 @@ LawHelp는 질문 처리 흐름을 단순 RAG 호출이 아니라 단계별 Agen
 | 강경현 | `letscodedirty` | Data Processing, RAG Evaluation, Frontend |
 | 이정대 | `JJungDae` | Backend, AI Agent, DevOps/Infra |
 
-팀명은 추후 확정 후 추가 예정입니다.
+### 팀명: 생활백답
 
 ## 7. 참고자료 / 발표자료
 
 - 데이터 출처: 법제처 찾기 쉬운 생활법령정보 백문백답
-- 발표자료: 추후 추가 예정
+- 발표자료: `https://docs.google.com/presentation/d/1TID68N6BgGHnVK51T1M22EpA2Z54zDUtnRWnZlHSbHs/edit?usp=sharing`
 - Repository: `https://github.com/JJungDae/lawHelp-agent`
 
 ## 8. 시스템 아키텍처
