@@ -3,7 +3,7 @@ schema_version: 1
 team:
   number: "1조"
   folder_name: "team01-lawhelp-agent"
-  name: ""
+  name: "생활백답"
   members:
     - name: "강경현"
       github: "letscodedirty"
@@ -64,9 +64,9 @@ tech_stack:
     - "GitHub Actions"
 
 links:
-  demo_video_url: ""
-  deployed_url: ""
-  presentation_url: ""
+  demo_video_url: "https://drive.google.com/file/d/1GgplS6b5uRy2WHCrbORkf0x9PsKjxV4V/view?usp=drive_link"
+  deployed_url: "http://8.230.11.213:8501/"
+  presentation_url: "https://docs.google.com/presentation/d/1TID68N6BgGHnVK51T1M22EpA2Z54zDUtnRWnZlHSbHs/edit?usp=sharing"
   repository_url: "https://github.com/JJungDae/lawHelp-agent"
 
 blog:
@@ -75,4 +75,4 @@ blog:
     - "RAG"
     - "Legal-AI"
     - "AI-Agent"
-  cover_image: ""
+  cover_image: "docs/assets/cover.png"
